@@ -1,0 +1,93 @@
+# Object files (Linux/macOS & Windows)
+*.o
+*.obj
+
+# CUDA Specific Intermediate files
+# Parallel Thread Execution files
+*.ptx
+# CUDA binary files
+*.cubin
+# CUDA fat binary files
+*.fatbin
+# CUDA module files
+*.cu.o
+
+# Static libraries
+*.a
+*.lib
+
+# Shared libraries / Dynamic Linked Libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+/bin/
+/out/
+/dist/
+/target/
+
+# Windows executables
+*.exe
+*.exp
+*.pdb
+*.ilk
+
+# CMake
+/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+install_manifest.txt
+CTestTestfile.cmake
+cpack_packages/
+
+# Make
+.dep/
+
+# Legacy NVProf files
+*.nvvp
+*.nvprof
+
+# Nsight Systems / Nsight Compute reports
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+
+# JetBrains (CLion)
+.idea/
+cmake-build-*/
+
+# macOS System
+.DS_Store
+
+/data/
+/datasets/
+/models/
+
+# Log files
+*.log
+
+# files
+CudaRuntimeTest.vcxproj
+CudaRuntimeTest.code-workspace
+x64/
+!libfftw3f-3.dll
+!libfftw3f-3.lib
+
