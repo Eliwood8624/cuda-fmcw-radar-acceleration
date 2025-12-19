@@ -1,5 +1,6 @@
 ﻿#include <iostream>
 #include <chrono>
+#include <cuda_runtime.h>
 #include "RadarParams.h"
 #include "CpuBaseline.h"
 #include "GpuProcessor.h"
