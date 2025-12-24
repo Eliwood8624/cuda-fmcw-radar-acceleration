@@ -58,7 +58,9 @@ int main()
     // ==========================================
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "Warming up GPU (Initializing Context & Planning)..." << std::endl;
-    gpu_process_new_way(all_frames[0], gpu_result);
+    GpuRadarProcessor GPU_process(rxNum, chirpNum, adcNum);
+
+    GPU_process.process(all_frames[0], gpu_result);
 
     // 确保预热彻底完成
     cudaDeviceSynchronize();
@@ -71,7 +73,7 @@ int main()
 
     for (int i = 0; i < NUM_FRAMES; i++)
     {
-        gpu_process_new_way(all_frames[i], gpu_result);
+        GPU_process.process(all_frames[i], gpu_result);
     }
 
     auto end_gpu = std::chrono::high_resolution_clock::now();

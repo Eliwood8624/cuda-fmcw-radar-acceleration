@@ -2,8 +2,6 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cufft.h>
-#include <stdexcept>
-#include <string>
 #include "GpuProcessor.h"
 #include "RadarParams.h"
 
@@ -16,36 +14,6 @@
                   << cudaGetErrorString(error) << std::endl; \
         exit(1); \
     } \
-}
-
-struct CudaDeleter 
-{
-    void operator()(void* ptr) const 
-    {
-        if (ptr) 
-        {
-            cudaError_t err = cudaFree(ptr);
-            if (err != cudaSuccess) 
-            {
-                std::cerr << "CUDA Free Error: " << cudaGetErrorString(err) << std::endl;
-            }
-        }
-    }
-};
-
-template <typename T>
-using DevicePtr = std::unique_ptr<T, CudaDeleter>;
-
-template <typename T>
-DevicePtr<T> make_device_unique(size_t size)
-{
-    T* outPtr = nullptr;
-    cudaError_t err = cudaMalloc(&outPtr, size * sizeof(T));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("cudaMalloc failed: "));
-    }
-    return DevicePtr<T>(outPtr);
 }
 
 // fft1d前的加窗以及数据转换
@@ -114,96 +82,175 @@ __global__ void transpose_doppler_kernel(
     }
 }
 
-// inData[rxNum][chirpNum][adcNum]
-void gpu_process_new_way(std::vector<int16_t>& inData, std::vector<std::complex<float>>& outData)
+struct CudaDeleter
 {
-    size_t inDataSize = inData.size();
-    size_t fft1dSize = inData.size();
-    size_t fft2dSize = (adcNum / 2) * chirpNum * rxNum;
-    size_t rangeWinSize = adcNum;
-    size_t dopplerWinSize = chirpNum;
-    auto d_inData = make_device_unique<int16_t>(inDataSize);
-    auto d_fft1d_data = make_device_unique<cufftComplex>(fft1dSize);
-    auto d_temp_Data = make_device_unique<cufftComplex>(fft1dSize);
-    auto d_fft2d_data = make_device_unique<cufftComplex>(fft2dSize);
-    auto d_rangeWin = make_device_unique<float>(rangeWinSize);
-    auto d_dopplerWin = make_device_unique<float>(dopplerWinSize);
-    CHECK_CUDA(cudaMemcpy(d_inData.get(), inData.data(), inDataSize, cudaMemcpyHostToDevice));
+    void operator()(void* ptr) const
+    {
+        if (ptr)
+        {
+            cudaError_t err = cudaFree(ptr);
+            if (err != cudaSuccess)
+            {
+                std::cerr << "CUDA Free Error: " << cudaGetErrorString(err) << std::endl;
+            }
+        }
+    }
+};
+
+template <typename T>
+using DevicePtr = std::unique_ptr<T, CudaDeleter>;
+
+template <typename T>
+DevicePtr<T> make_device_unique(size_t size)
+{
+    T* outPtr = nullptr;
+    cudaError_t err = cudaMalloc(&outPtr, size * sizeof(T));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error(std::string("cudaMalloc failed: "));
+    }
+    return DevicePtr<T>(outPtr);
+}
+
+class CufftPlan {
+public:
+    CufftPlan() : plan_(0) {}
+    CufftPlan(int nx, cufftType type, int batch) {
+        if (cufftPlan1d(&plan_, nx, type, batch) != CUFFT_SUCCESS) {
+            throw std::runtime_error("cufftPlan1d failed");
+        }
+    }
+
+    ~CufftPlan() {
+        if (plan_) {
+            cufftDestroy(plan_);
+        }
+    }
+
+    void reset(int nx, cufftType type, int batch) {
+        if (plan_) {
+            cufftDestroy(plan_);
+            plan_ = 0;
+        }
+        if (cufftPlan1d(&plan_, nx, type, batch) != CUFFT_SUCCESS) {
+            throw std::runtime_error("cufftPlan1d failed during reset");
+        }
+    }
+
+    // 禁止拷贝
+    CufftPlan(const CufftPlan&) = delete;
+    CufftPlan& operator=(const CufftPlan&) = delete;
+
+    // 只读
+    cufftHandle get() const { return plan_; }
+
+private:
+    cufftHandle plan_ = 0;
+}; 
+
+struct GpuRadarProcessor::Impl
+{
+    DevicePtr<int16_t> d_inData;
+    DevicePtr<cufftComplex> d_fft1d_data;
+    DevicePtr<cufftComplex> d_temp_Data;
+    DevicePtr<cufftComplex> d_fft2d_data;
+    DevicePtr<float> d_rangeWin;
+    DevicePtr<float> d_dopplerWin;
+    CufftPlan rangeFftPlan;
+    CufftPlan dopplerFftPlan;
+};
+
+GpuRadarProcessor::GpuRadarProcessor(int rxNum, int chirpNum, int sampleNum)
+{
+    m_rxNum = rxNum;
+    m_chirpNum = chirpNum;
+    m_sampleNum = sampleNum;
+
+    pImpl = std::make_unique<Impl>();
+
+    size_t inDataSize = m_rxNum * m_chirpNum * m_sampleNum;
+    size_t fft1dSize = m_rxNum * m_chirpNum * m_sampleNum;
+    size_t fft2dSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
+    size_t rangeWinSize = sampleNum;
+    size_t dopplerWinSize = m_chirpNum;
+    pImpl->d_inData = make_device_unique<int16_t>(inDataSize);
+    pImpl->d_fft1d_data = make_device_unique<cufftComplex>(fft1dSize);
+    pImpl->d_temp_Data = make_device_unique<cufftComplex>(fft1dSize);
+    pImpl->d_fft2d_data = make_device_unique<cufftComplex>(fft2dSize);
+    pImpl->d_rangeWin = make_device_unique<float>(rangeWinSize);
+    pImpl->d_dopplerWin = make_device_unique<float>(dopplerWinSize);
 
     std::vector<float> h_WinBuf;
-    create_symmetric_hanning_window(h_WinBuf, adcNum);
-    CHECK_CUDA(cudaMemcpy(d_rangeWin.get(), h_WinBuf.data(), rangeWinSize, cudaMemcpyHostToDevice));
+    create_symmetric_hanning_window(h_WinBuf, sampleNum);
+    CHECK_CUDA(cudaMemcpy(pImpl->d_rangeWin.get(), h_WinBuf.data(), rangeWinSize * sizeof(float), cudaMemcpyHostToDevice));
     create_symmetric_hanning_window(h_WinBuf, chirpNum);
-    CHECK_CUDA(cudaMemcpy(d_dopplerWin.get(), h_WinBuf.data(), dopplerWinSize, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(pImpl->d_dopplerWin.get(), h_WinBuf.data(), dopplerWinSize * sizeof(float), cudaMemcpyHostToDevice));
 
+    int fft1dLoopNum = chirpNum * rxNum;
+    int fft2dLoopNum = (adcNum / 2) * rxNum;
+    pImpl->rangeFftPlan.reset(sampleNum, CUFFT_C2C, fft1dLoopNum);
+    pImpl->dopplerFftPlan.reset(chirpNum, CUFFT_C2C, fft2dLoopNum);
+}
+
+GpuRadarProcessor::~GpuRadarProcessor() = default;
+
+// inData[rxNum][chirpNum][adcNum]
+void GpuRadarProcessor::process(const std::vector<int16_t>& dataInput, std::vector<std::complex<float>>& dataOutput)
+{
+    size_t inDataSize = m_rxNum * m_chirpNum * m_sampleNum;
+    CHECK_CUDA(cudaMemcpy(pImpl->d_inData.get(), dataInput.data(), inDataSize * sizeof(int16_t), cudaMemcpyHostToDevice));
 
     // 变量类型转换以及加窗
     int threads = 256;
-    int blocks_pre = (rxNum * chirpNum * adcNum + threads - 1) / threads;
-    preprocess_range_window_kernel <<<blocks_pre, threads >>> (
-        d_inData.get(), d_fft1d_data.get(), d_rangeWin.get(),
-        rxNum * chirpNum * adcNum, adcNum);
+    int blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum + threads - 1) / threads;
+    preprocess_range_window_kernel <<<blocks_pre, threads>>> (
+        pImpl->d_inData.get(), pImpl->d_fft1d_data.get(), pImpl->d_rangeWin.get(),
+        m_rxNum * m_chirpNum * m_sampleNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
 
     // 1dfft
-    cufftHandle plan_range;
-    int fft1dLoopNum = chirpNum * rxNum;
-    if (cufftPlan1d(&plan_range, adcNum, CUFFT_C2C, fft1dLoopNum) != CUFFT_SUCCESS)
-    {
-        std::cerr << "CUFFT Plan creation failed!" << std::endl;
-        return;
-    }
-    if (cufftExecC2C(plan_range, d_fft1d_data.get(), d_fft1d_data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
+    if (cufftExecC2C(pImpl->rangeFftPlan.get(), pImpl->d_fft1d_data.get(), pImpl->d_fft1d_data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
     {
         std::cerr << "CUFFT Exec failed!" << std::endl;
         return;
     }
 
     // 加窗转置
-    blocks_pre = (rxNum * chirpNum * adcNum / 2 + threads - 1) / threads;
+    blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum / 2 + threads - 1) / threads;
     transpose_discard_doppler_window_kernel <<<blocks_pre, threads>>> (
-        d_fft1d_data.get(), d_fft2d_data.get(), d_rangeWin.get(),
-        rxNum, chirpNum, adcNum);
+        pImpl->d_fft1d_data.get(), pImpl->d_fft2d_data.get(), pImpl->d_rangeWin.get(),
+        m_rxNum, m_chirpNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
 
     //fft2d
-    cufftHandle plan_doppler;
-    int fft2dLoopNum = (adcNum / 2) * rxNum;
-    if (cufftPlan1d(&plan_doppler, chirpNum, CUFFT_C2C, fft2dLoopNum) != CUFFT_SUCCESS)
-    {
-        std::cerr << "CUFFT Plan creation failed!" << std::endl;
-        return;
-    }
-    if (cufftExecC2C(plan_doppler, d_fft2d_data.get(), d_temp_Data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
+    if (cufftExecC2C(pImpl->dopplerFftPlan.get(), pImpl->d_fft2d_data.get(), pImpl->d_temp_Data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
     {
         std::cerr << "CUFFT Exec failed!" << std::endl;
         return;
     }
 
     // 转置
-    blocks_pre = (rxNum * chirpNum * adcNum / 2 + threads - 1) / threads;
+    blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum / 2 + threads - 1) / threads;
     transpose_doppler_kernel <<<blocks_pre, threads>>> (
-        d_temp_Data.get(), d_fft2d_data.get(),
-        rxNum, chirpNum, adcNum);
+        pImpl->d_temp_Data.get(), pImpl->d_fft2d_data.get(),
+        m_rxNum, m_chirpNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
     ////调试查看数据
     //{
     //    std::complex<float>* host_debug = new std::complex<float>[100];
-    //    cudaMemcpy(host_debug, d_fft2d_data, 100 * sizeof(std::complex<float>), cudaMemcpyDeviceToHost);
-    //    cudaMemcpy(host_debug, d_fft2d_data + 512, 100 * sizeof(std::complex<float>), cudaMemcpyDeviceToHost);
+    //    cudaMemcpy(host_debug, pImpl->d_fft2d_data.get(), 100 * sizeof(std::complex<float>), cudaMemcpyDeviceToHost);
+    //    cudaMemcpy(host_debug, pImpl->d_fft2d_data.get() + m_chirpNum, 100 * sizeof(std::complex<float>), cudaMemcpyDeviceToHost);
     //    delete[] host_debug;
     //}
 
     //等待 GPU 完成 (用于计时准确性)
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    if (outData.size() != fft2dSize)
+    size_t fft2dSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
+    if (dataOutput.size() != fft2dSize)
     {
-        outData.resize(fft2dSize);
+        dataOutput.resize(fft2dSize);
     }
-    CHECK_CUDA(cudaMemcpy(outData.data(), d_fft2d_data.get(), fft2dSize, cudaMemcpyDeviceToHost));
-
-    cufftDestroy(plan_range);
-    cufftDestroy(plan_doppler);
+    CHECK_CUDA(cudaMemcpy(dataOutput.data(), pImpl->d_fft2d_data.get(), fft2dSize * sizeof(std::complex<float>), cudaMemcpyDeviceToHost));
 }
 

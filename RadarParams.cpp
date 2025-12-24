@@ -18,6 +18,13 @@ void read_radar_data(int16_t* data, size_t total_points)
     int16_t readXSize, readYSize, readZSize;
 
     std::ifstream file("test_data.bin", std::ios::binary);
+    char fullPath[_MAX_PATH];
+    if (_fullpath(fullPath, "test_data.bin", _MAX_PATH) != NULL) {
+        std::cout << "当前程序使用数据文件路径是: " << fullPath << std::endl;
+    }
+    else {
+        std::cout << "无法获取绝对路径" << std::endl;
+    }
 
     if (!file.is_open())
     {
