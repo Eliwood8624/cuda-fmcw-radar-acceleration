@@ -20,6 +20,7 @@
 - [x] **高性能 FFT**：使用 `cuFFT` 库进行批量 1D 和 2D FFT 运算。
 - [x] **自定义 CUDA Kernel**：针对矩阵转置、数据加窗编写了高效的 Kernel。
 - [x] **RAII**：基于现代C++，安全高效。
+- [x] **模块化设计**：C++ 类封装，易于集成到现有的雷达 SDK 或 ROS 环境中。
 
 ## 🛠️ 信号处理流程 (Processing Pipeline)
 
@@ -39,8 +40,8 @@
 
 | Module | CPU Time (ms) | GPU Time (ms) | Speedup |
 | :--- | :---: | :---: | :---: |
-| Range FFT + Doppler FFT | 863.697 | 265.222 | **3.2565x** |
-| **Total Pipeline** | **863.697** | **265.222** | **3.2565x** |
+| Range FFT + Doppler FFT | 832.222 | 137.314 | **6.06074x** |
+| **Total Pipeline** | **832.222** | **137.314** | **6.06074x** |
 
 ## 🗓️ 开发优化计划 (Roadmap/To-Do)
 
@@ -49,7 +50,6 @@
 - [ ] **CFAR Detection**：恒虚警率检测 (CA-CFAR / OS-CFAR)
 - [ ] **Angle Estimation**：角度估算 (基于 FFT 或 DBF)
 - [ ] **流并发 (CUDA Streams)**：利用流技术实现数据传输（H2D/D2H）与计算的重叠，进一步降低延迟。
-- [ ] **模块化设计**：C++ 类封装，易于集成到现有的雷达 SDK 或 ROS 环境中。
 - [ ] **可视化**：接入 OpenGL 渲染 Range-Doppler 热力图。
 
 ## 🔧 环境依赖 (Prerequisites)
