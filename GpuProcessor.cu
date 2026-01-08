@@ -5,6 +5,8 @@
 #include "GpuProcessor.h"
 #include "RadarParams.h"
 
+#include <nvtx3/nvToolsExt.h>
+
 #define CHECK_CUDA(call) \
 { \
     const cudaError_t error = call; \
@@ -112,7 +114,55 @@ DevicePtr<T> make_device_unique(size_t size)
     return DevicePtr<T>(outPtr);
 }
 
-class CufftPlan {
+struct HostPinnedDeleter
+{
+    void operator()(void* ptr) const
+    {
+        if (ptr)
+        {
+            cudaError_t err = cudaFreeHost(ptr);
+            if (err != cudaSuccess)
+            {
+                std::cerr << "CUDA Host Free Error: " << cudaGetErrorString(err) << std::endl;
+            }
+        }
+    }
+};
+
+template <typename T>
+using HostPinnedPtr = std::unique_ptr<T, HostPinnedDeleter>;
+
+template <typename T>
+HostPinnedPtr<T> make_hostPinn_unique(size_t size)
+{
+    T* outPtr = nullptr;
+    cudaError_t err = cudaMallocHost(&outPtr, size * sizeof(T));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error(std::string("cudaMallocHost failed: "));
+    }
+    return HostPinnedPtr<T>(outPtr);
+}
+
+struct CudaStreamDeleter
+{
+    void operator()(cudaStream_t s) const
+    {
+        if (s)
+        {
+            cudaError_t err = cudaStreamDestroy(s);
+            if (err != cudaSuccess)
+            {
+                std::cerr << "CUDA Stream Destroy Error: " << cudaGetErrorString(err) << std::endl;
+            }
+        }
+    }
+};
+
+using CudaStream = std::unique_ptr<CUstream_st, CudaStreamDeleter>;
+
+class CufftPlan
+{
 public:
     CufftPlan() : plan_(0) {}
     CufftPlan(int nx, cufftType type, int batch) {
@@ -127,6 +177,24 @@ public:
         }
     }
 
+    CufftPlan(const CufftPlan&) = delete;
+
+    CufftPlan& operator=(const CufftPlan&) = delete;
+
+    CufftPlan(CufftPlan&& other) noexcept : plan_(other.plan_) {
+        other.plan_ = 0;
+    }
+
+    CufftPlan& operator=(CufftPlan&& other) noexcept {
+        if (this != &other) {
+            if (plan_) cufftDestroy(plan_);
+            plan_ = other.plan_;
+            other.plan_ = 0;
+        }
+        return *this;
+    }
+
+    cufftHandle get() const { return plan_; }
     void reset(int nx, cufftType type, int batch) {
         if (plan_) {
             cufftDestroy(plan_);
@@ -137,19 +205,15 @@ public:
         }
     }
 
-    // 禁止拷贝
-    CufftPlan(const CufftPlan&) = delete;
-    CufftPlan& operator=(const CufftPlan&) = delete;
-
-    // 只读
-    cufftHandle get() const { return plan_; }
 
 private:
     cufftHandle plan_ = 0;
 }; 
 
-struct GpuRadarProcessor::Impl
+struct streamContext
 {
+    HostPinnedPtr<int16_t> h_pinnedInData;
+    HostPinnedPtr<cufftComplex> h_pinnedOutData;
     DevicePtr<int16_t> d_inData;
     DevicePtr<cufftComplex> d_fft1d_data;
     DevicePtr<cufftComplex> d_temp_Data;
@@ -160,56 +224,88 @@ struct GpuRadarProcessor::Impl
     CufftPlan dopplerFftPlan;
 };
 
+
+struct GpuRadarProcessor::Impl
+{
+    std::vector<CudaStream> streams;
+    std::vector<streamContext> sContext;
+};
+
 GpuRadarProcessor::GpuRadarProcessor(int rxNum, int chirpNum, int sampleNum)
 {
     m_rxNum = rxNum;
     m_chirpNum = chirpNum;
     m_sampleNum = sampleNum;
 
-    pImpl = std::make_unique<Impl>();
-
-    size_t inDataSize = m_rxNum * m_chirpNum * m_sampleNum;
-    size_t fft1dSize = m_rxNum * m_chirpNum * m_sampleNum;
-    size_t fft2dSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
-    size_t rangeWinSize = sampleNum;
-    size_t dopplerWinSize = m_chirpNum;
-    pImpl->d_inData = make_device_unique<int16_t>(inDataSize);
-    pImpl->d_fft1d_data = make_device_unique<cufftComplex>(fft1dSize);
-    pImpl->d_temp_Data = make_device_unique<cufftComplex>(fft1dSize);
-    pImpl->d_fft2d_data = make_device_unique<cufftComplex>(fft2dSize);
-    pImpl->d_rangeWin = make_device_unique<float>(rangeWinSize);
-    pImpl->d_dopplerWin = make_device_unique<float>(dopplerWinSize);
-
-    std::vector<float> h_WinBuf;
-    create_symmetric_hanning_window(h_WinBuf, sampleNum);
-    CHECK_CUDA(cudaMemcpy(pImpl->d_rangeWin.get(), h_WinBuf.data(), rangeWinSize * sizeof(float), cudaMemcpyHostToDevice));
-    create_symmetric_hanning_window(h_WinBuf, chirpNum);
-    CHECK_CUDA(cudaMemcpy(pImpl->d_dopplerWin.get(), h_WinBuf.data(), dopplerWinSize * sizeof(float), cudaMemcpyHostToDevice));
-
-    int fft1dLoopNum = chirpNum * rxNum;
-    int fft2dLoopNum = (adcNum / 2) * rxNum;
-    pImpl->rangeFftPlan.reset(sampleNum, CUFFT_C2C, fft1dLoopNum);
-    pImpl->dopplerFftPlan.reset(chirpNum, CUFFT_C2C, fft2dLoopNum);
+    initImpl();
 }
 
 GpuRadarProcessor::~GpuRadarProcessor() = default;
 
-// inData[rxNum][chirpNum][adcNum]
-void GpuRadarProcessor::process(const std::vector<int16_t>& dataInput, std::vector<std::complex<float>>& dataOutput)
+void GpuRadarProcessor::initImpl()
 {
+    pImpl = std::make_unique<Impl>();
+    pImpl->streams.resize(STREAM_NUM);
+    pImpl->sContext.resize(STREAM_NUM);
+
+    for(int i = 0; i < STREAM_NUM; i ++)
+    {
+        // 初始化stream
+        pImpl->streams[i] = CudaStream(nullptr, CudaStreamDeleter());
+        cudaStream_t raw_s;
+        CHECK_CUDA(cudaStreamCreate(&raw_s));
+        pImpl->streams[i].reset(raw_s);
+
+        size_t inDataSize = m_rxNum * m_chirpNum * m_sampleNum;
+        size_t fft1dSize = m_rxNum * m_chirpNum * m_sampleNum;
+        size_t fft2dSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
+        size_t rangeWinSize = m_sampleNum;
+        size_t dopplerWinSize = m_chirpNum;
+        pImpl->sContext[i].h_pinnedInData = make_hostPinn_unique<int16_t>(inDataSize);
+        pImpl->sContext[i].h_pinnedOutData = make_hostPinn_unique<cufftComplex>(fft2dSize);
+        pImpl->sContext[i].d_inData = make_device_unique<int16_t>(inDataSize);
+        pImpl->sContext[i].d_fft1d_data = make_device_unique<cufftComplex>(fft1dSize);
+        pImpl->sContext[i].d_temp_Data = make_device_unique<cufftComplex>(fft1dSize);
+        pImpl->sContext[i].d_fft2d_data = make_device_unique<cufftComplex>(fft2dSize);
+        pImpl->sContext[i].d_rangeWin = make_device_unique<float>(rangeWinSize);
+        pImpl->sContext[i].d_dopplerWin = make_device_unique<float>(dopplerWinSize);
+
+        std::vector<float> h_WinBuf;
+        create_symmetric_hanning_window(h_WinBuf, m_sampleNum);
+        CHECK_CUDA(cudaMemcpy(pImpl->sContext[i].d_rangeWin.get(), h_WinBuf.data(), rangeWinSize * sizeof(float), cudaMemcpyHostToDevice));
+        create_symmetric_hanning_window(h_WinBuf, m_chirpNum);
+        CHECK_CUDA(cudaMemcpy(pImpl->sContext[i].d_dopplerWin.get(), h_WinBuf.data(), dopplerWinSize * sizeof(float), cudaMemcpyHostToDevice));
+
+        int fft1dLoopNum = m_chirpNum * rxNum;
+        int fft2dLoopNum = (adcNum / 2) * rxNum;
+        pImpl->sContext[i].rangeFftPlan.reset(m_sampleNum, CUFFT_C2C, fft1dLoopNum);
+        pImpl->sContext[i].dopplerFftPlan.reset(m_chirpNum, CUFFT_C2C, fft2dLoopNum);
+    }
+}
+
+// inData[rxNum][chirpNum][adcNum]
+void GpuRadarProcessor::processAsync(const std::vector<int16_t>& dataInput, std::vector<std::complex<float>>& dataOutput, int frameIdx)
+{
+    int streamIdx = frameIdx % STREAM_NUM;
+    cudaStreamSynchronize(pImpl->streams[streamIdx].get());
+
     size_t inDataSize = m_rxNum * m_chirpNum * m_sampleNum;
-    CHECK_CUDA(cudaMemcpy(pImpl->d_inData.get(), dataInput.data(), inDataSize * sizeof(int16_t), cudaMemcpyHostToDevice));
+    nvtxRangePush("H2P memcpy"); // 在时间轴上开始一个叫 "H2D Copy" 的色块
+    memcpy(pImpl->sContext[streamIdx].h_pinnedInData.get(), dataInput.data(), inDataSize * sizeof(int16_t));
+    nvtxRangePop();            // 结束色块
+    CHECK_CUDA(cudaMemcpyAsync(pImpl->sContext[streamIdx].d_inData.get(), pImpl->sContext[streamIdx].h_pinnedInData.get(), inDataSize * sizeof(int16_t), cudaMemcpyHostToDevice, pImpl->streams[streamIdx].get()));
 
     // 变量类型转换以及加窗
     int threads = 256;
     int blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum + threads - 1) / threads;
-    preprocess_range_window_kernel <<<blocks_pre, threads>>> (
-        pImpl->d_inData.get(), pImpl->d_fft1d_data.get(), pImpl->d_rangeWin.get(),
+    preprocess_range_window_kernel <<<blocks_pre, threads, 0, pImpl->streams[streamIdx].get() >> > (
+        pImpl->sContext[streamIdx].d_inData.get(), pImpl->sContext[streamIdx].d_fft1d_data.get(), pImpl->sContext[streamIdx].d_rangeWin.get(),
         m_rxNum * m_chirpNum * m_sampleNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
 
     // 1dfft
-    if (cufftExecC2C(pImpl->rangeFftPlan.get(), pImpl->d_fft1d_data.get(), pImpl->d_fft1d_data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
+    cufftSetStream(pImpl->sContext[streamIdx].rangeFftPlan.get(), pImpl->streams[streamIdx].get());
+    if (cufftExecC2C(pImpl->sContext[streamIdx].rangeFftPlan.get(), pImpl->sContext[streamIdx].d_fft1d_data.get(), pImpl->sContext[streamIdx].d_fft1d_data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
     {
         std::cerr << "CUFFT Exec failed!" << std::endl;
         return;
@@ -217,13 +313,14 @@ void GpuRadarProcessor::process(const std::vector<int16_t>& dataInput, std::vect
 
     // 加窗转置
     blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum / 2 + threads - 1) / threads;
-    transpose_discard_doppler_window_kernel <<<blocks_pre, threads>>> (
-        pImpl->d_fft1d_data.get(), pImpl->d_fft2d_data.get(), pImpl->d_rangeWin.get(),
+    transpose_discard_doppler_window_kernel <<<blocks_pre, threads, 0, pImpl->streams[streamIdx].get()>>> (
+        pImpl->sContext[streamIdx].d_fft1d_data.get(), pImpl->sContext[streamIdx].d_fft2d_data.get(), pImpl->sContext[streamIdx].d_dopplerWin.get(),
         m_rxNum, m_chirpNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
 
     //fft2d
-    if (cufftExecC2C(pImpl->dopplerFftPlan.get(), pImpl->d_fft2d_data.get(), pImpl->d_temp_Data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
+    cufftSetStream(pImpl->sContext[streamIdx].dopplerFftPlan.get(), pImpl->streams[streamIdx].get());
+    if (cufftExecC2C(pImpl->sContext[streamIdx].dopplerFftPlan.get(), pImpl->sContext[streamIdx].d_fft2d_data.get(), pImpl->sContext[streamIdx].d_temp_Data.get(), CUFFT_FORWARD) != CUFFT_SUCCESS)
     {
         std::cerr << "CUFFT Exec failed!" << std::endl;
         return;
@@ -231,8 +328,8 @@ void GpuRadarProcessor::process(const std::vector<int16_t>& dataInput, std::vect
 
     // 转置
     blocks_pre = (m_rxNum * m_chirpNum * m_sampleNum / 2 + threads - 1) / threads;
-    transpose_doppler_kernel <<<blocks_pre, threads>>> (
-        pImpl->d_temp_Data.get(), pImpl->d_fft2d_data.get(),
+    transpose_doppler_kernel <<<blocks_pre, threads, 0, pImpl->streams[streamIdx].get()>>> (
+        pImpl->sContext[streamIdx].d_temp_Data.get(), pImpl->sContext[streamIdx].d_fft2d_data.get(),
         m_rxNum, m_chirpNum, m_sampleNum);
     CHECK_CUDA(cudaGetLastError());
     ////调试查看数据
@@ -243,14 +340,20 @@ void GpuRadarProcessor::process(const std::vector<int16_t>& dataInput, std::vect
     //    delete[] host_debug;
     //}
 
-    //等待 GPU 完成 (用于计时准确性)
-    CHECK_CUDA(cudaDeviceSynchronize());
-
     size_t fft2dSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
     if (dataOutput.size() != fft2dSize)
     {
         dataOutput.resize(fft2dSize);
     }
-    CHECK_CUDA(cudaMemcpy(dataOutput.data(), pImpl->d_fft2d_data.get(), fft2dSize * sizeof(std::complex<float>), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpyAsync(pImpl->sContext[streamIdx].h_pinnedOutData.get(), pImpl->sContext[streamIdx].d_fft2d_data.get(), fft2dSize * sizeof(std::complex<float>), cudaMemcpyDeviceToHost, pImpl->streams[streamIdx].get()));
 }
 
+void GpuRadarProcessor::collectResult(std::vector<std::complex<float>>& out, int frameIdx) {
+    int idx = frameIdx % STREAM_NUM;
+    size_t outSize = (m_sampleNum / 2) * m_chirpNum * m_rxNum;
+
+    nvtxRangePush("P2H memcpy"); // 在时间轴上开始一个叫 "H2D Copy" 的色块
+    cudaStreamSynchronize(pImpl->streams[idx].get()); // 确保 DtoH 完成
+    memcpy(out.data(), pImpl->sContext[idx].h_pinnedOutData.get(), outSize * sizeof(std::complex<float>)); // 安全搬运
+    nvtxRangePop();            // 结束色块
+}
